@@ -342,11 +342,16 @@ class SMC(object):
             # we always resample self.N particles, even if smc.X has a
             # different size (example: waste-free)
             self.Xp = self.X[self.A]
+            try:
+                self.Xp.shared['grad'] = self.X.shared['grad'][self.A]
+            except IndexError:
+                pass
             self.reset_weights()
         else:
             self.A = np.arange(self.N)
             self.Xp = self.X
         self.X = self.fk.M(self.t, self.Xp)
+        
 
     def resample_move_qmc(self):
         self.rs_flag = True  # we *always* resample in SQMC

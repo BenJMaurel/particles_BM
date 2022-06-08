@@ -194,11 +194,13 @@ import itertools
 import numpy as np
 from numpy import random
 from scipy import optimize, stats, linalg
-
+from particles import distributions 
+import matplotlib.pyplot as plt
 import particles
 from particles import resampling as rs
 from particles.state_space_models import Bootstrap
 
+import os
 ###################################
 # Static models
 
@@ -295,7 +297,7 @@ class TemperingBridge(StaticModel):
         self.prior = base_dist
 
     def loglik(self, theta):
-        return self.logtarget(theta) - self.prior.logpdf(theta)
+        return np.nan_to_num(self.logtarget(theta) - self.prior.logpdf(theta), copy=False, nan=-np.inf)
 
     def logpost(self, theta):
         return self.logtarget(theta)
@@ -570,43 +572,281 @@ class ArrayMCMC(object):
 
         """
         raise NotImplementedError
-        
-class ArrayHMC(ArrayMCMC):
-    def proposal(self, xprop, pprop, eps, target):
-        arr = view_2d_array(xprop.theta)
-        pprop = pprop - eps*xprop.shared['grad']/2
-        arr = arr + (eps*np.linalg.inv(xprop.shared['chol_cov'])@pprop).T
+
+class ArrayTHMC(ArrayMCMC):
+    def proposal(self, xprop, eps, target):
+        arr_prop = view_2d_array(xprop.theta)
+        arr = np.copy(arr_prop)
+        L = linalg.cholesky(xprop.shared['chol_cov'], lower = True)
+        p = stats.norm.rvs(size = arr_prop.shape)@(eps*L.T)
+        # plt.plot(arr[:,0], arr[:,1], c = 'r')
+        arr_prop[:,:] = arr + p + eps*xprop.shared['grad']
+        grad_x = xprop.shared['grad']
         target(xprop)
-        pprop = pprop - eps*xprop.shared['grad']/2
-        return arr, pprop
-        
-    def step(self, x, target = None):
-        L = x.shared['chol_cov']
-        T = 1
+        # print(grad_x -xprop.shared["grad"])
+        # for i in range(100):
+        #     plot = [[arr[i,0], arr_prop[i,0]], [arr[i,1], arr_prop[i,1]]]
+        #     plt.plot([arr[i,0], arr_prop[i,0]],[arr[i,1],arr_prop[i,1]], c = 'black')
+        # plt.scatter(arr[:100,0], arr[:100,1], c = 'b')
+        # plt.scatter(arr_prop[:100,0], arr_prop[:100,1], c = 'r')     
+        return xprop, grad_x
+
+    def step(self, x, target = None, weights = None, test = False):
+        cov = x.shared['chol_cov']
+        T = 5
+        L = linalg.cholesky(cov, lower=True)
         grad = x.shared['grad']
-        # eps = x.shared['eps']
-        eps = 0.1
+        eps = x.shared['eps']
         xprop = x.__class__(theta=np.empty_like(x.theta))
         arr = view_2d_array(x.theta)
         xprop.theta = x.theta.copy()
         xprop.shared = x.shared
-        p = (stats.norm.rvs(size=arr.shape)*np.diag(L)).T
-        pprop = p.copy()
         for t in range(T):
-            xprop.theta, pprop = self.proposal(xprop, pprop, eps, target)
-        pb_accept = np.minimum(1, np.exp(xprop.lpost - 1/2*np.diag(pprop.T@np.linalg.inv(L)@ pprop)
-                                  - x.lpost + 1/2*np.diag(p.T @ np.linalg.inv(L)@p)))
-        accept = (random.rand(x.N) < pb_accept)
-        x.copyto(xprop, where=accept) 
-        return np.mean(pb_accept)
+            xprop, grad_x = self.proposal(xprop, eps, target)
+            arr_prop = view_2d_array(xprop.theta)
+            proba_q_y = -np.diag(((arr_prop- arr)/(4*eps)-grad_x)@np.linalg.inv(cov)@((arr_prop- arr)/(4*eps)-grad_x).T)
+            proba_q_x = -np.diag(((-arr_prop + arr)/(4*eps)-xprop.shared['grad'])@np.linalg.inv(cov)@((-arr_prop + arr)/(4*eps)-xprop.shared['grad']).T)
+            pb_accept = np.minimum(0, xprop.lpost - x.lpost + proba_q_x - proba_q_y)
+        accept = (np.log(random.rand(x.N)) < pb_accept)
+        x.copyto(xprop, where=accept)
+        target(x)
+        # arr = view_2d_array(x.theta)
+        # plt.scatter(arr[:100,0], arr[:100,1], c = 'g')
+        # plt.show()
+        return np.mean(np.exp(pb_accept))
+
+    def calibrate(self,W,x):
+        arr = view_2d_array(x.theta)
+        N, d = arr.shape
+        m, cov = rs.wmean_and_cov(W, arr)
+        # cov = np.linalg.inv(np.diag(np.diag(cov)))
+        x.shared['chol_cov'] = np.eye(cov.shape[0])
+        optimal_alpha = 0.5
+        x.shared['eps'] = optimal_alpha
+
+class ArrayHMC(ArrayMCMC):
+    # def proposal(self, xprop, pprop, eps, target):
+    #     arr = view_2d_array(xprop.theta)
+    #     tampon = arr - xprop.shared['grad']@(eps@eps.T)/2 + pprop
+    #     tampon2 = arr
+    #     pb_accept_1 = np.array([distributions.MvNormal(loc = arr[i] + eps@xprop.shared['grad'][i], cov = eps@eps.T).logpdf(x = tampon[i]) for i in range(len(arr))])
+    #     #pb_accept_1 = -0.5*np.diag(pprop@np.linalg.inv(eps@eps.T)@pprop.T)
+    #     arr[:,:] = tampon
+    #     target(xprop)
+    #     pb_accept_2 = np.array([distributions.MvNormal(loc = arr[i] + eps@xprop.shared['grad'][i], cov = eps@eps.T).logpdf(x = tampon2[i]) for i in range(len(arr))])
+    #     #pb_accept_2 = -0.5*np.diag((tampon - tampon2 + xprop.shared['grad'])@np.linalg.inv(eps@eps.T)@(tampon - tampon2 + xprop.shared['grad']).T)
+    #     #print(- pb_accept_1 + pb_accept_2)
+    #     return xprop, pprop, + pb_accept_1 - pb_accept_2
+
+    # def proposal(self, xprop, pprop, eps, target):
+    #     arr = view_2d_array(xprop.theta)
+    #     cov = xprop.shared['chol_cov']
+    #     pprop = pprop + eps*xprop.shared['grad']/2
+    #     arr[:,:] = arr + (eps*np.linalg.inv(cov)@pprop.T).T
+    #     target(xprop)
+    #     pprop = pprop + eps*xprop.shared['grad']/2
+    #     return xprop, pprop
+    def proposal(self, xprop, eps, target):
+        arr_prop = view_2d_array(xprop.theta)
+        arr = np.copy(arr_prop)
+        L = linalg.cholesky(xprop.shared['chol_cov'], lower = True)
+        p = stats.norm.rvs(size = arr_prop.shape)@(eps*L.T)
+        # plt.plot(arr[:,0], arr[:,1], c = 'r')
+        arr_prop[:,:] = arr + p + eps*xprop.shared['grad']
+        grad_x = xprop.shared['grad']
+        target(xprop)
+        # print(grad_x -xprop.shared["grad"])
+        # for i in range(100):
+        #     plot = [[arr[i,0], arr_prop[i,0]], [arr[i,1], arr_prop[i,1]]]
+        #     plt.plot([arr[i,0], arr_prop[i,0]],[arr[i,1],arr_prop[i,1]], c = 'black')
+        # plt.scatter(arr[:100,0], arr[:100,1], c = 'b')
+        # plt.scatter(arr_prop[:100,0], arr_prop[:100,1], c = 'r')     
+        return xprop, grad_x
+
+    def step(self, x, target = None, weights = None, test = False):
+        cov = x.shared['chol_cov']
+        T = 1
+        L = linalg.cholesky(cov, lower=True)
+        grad = x.shared['grad']
+        eps = x.shared['eps']
+        xprop = x.__class__(theta=np.empty_like(x.theta))
+        arr = view_2d_array(x.theta)
+        xprop.theta = x.theta.copy()
+        xprop.shared = x.shared
+        #p = stats.norm.rvs(size=arr_prop.shape)@L.T
+        #p = distributions.MvNormal(cov = cov).rvs(arr_prop.shape[0])
+        # pprop = p.copy()
+        # for t in range(T):
+            # xprop, pprop = self.proposal(xprop, pprop, eps, target) 
+        xprop, grad_x = self.proposal(xprop, eps, target)
+        arr_prop = view_2d_array(xprop.theta)
+        proba_q_y = -np.diag(((arr_prop- arr)/(4*eps)-grad_x)@np.linalg.inv(cov)@((arr_prop- arr)/(4*eps)-grad_x).T)
+        proba_q_x = -np.diag(((-arr_prop + arr)/(4*eps)-xprop.shared['grad'])@np.linalg.inv(cov)@((-arr_prop + arr)/(4*eps)-xprop.shared['grad']).T)
+        # pb_accept = np.minimum(0, (xprop.lpost - x.lpost + np.diag((xprop.theta - x.theta) - )@np.linalg.inv(cov)@pprop.T)
+        #                     - 0.5*np.diag(p@np.linalg.inv(cov)@p.T)))
+        #print(-xprop.lpost + x.lpost)
+        #pb_accept = np.minimum(1, np.exp(xprop.lpost - x.lpost + log_pb_accept))
+        pb_accept = np.minimum(0, xprop.lpost - x.lpost + proba_q_x - proba_q_y)
+        accept = (np.log(random.rand(x.N)) < pb_accept)
+        x.copyto(xprop, where=accept)
+        target(x)
+        # arr = view_2d_array(x.theta)
+        # plt.scatter(arr[:100,0], arr[:100,1], c = 'g')
+        # plt.show()
+        return np.mean(np.exp(pb_accept))
+
+    def calibrate(self,W,x):
+        arr = view_2d_array(x.theta)
+        N, d = arr.shape
+        m, cov = rs.wmean_and_cov(W, arr)
+        # cov = np.linalg.inv(np.diag(np.diag(cov)))
+        x.shared['chol_cov'] = np.eye(cov.shape[0])
+        optimal_alpha = 0.5
+        x.shared['eps'] = optimal_alpha
+
+    def calibrate2(self, W,x):
+        arr = view_2d_array(x.theta)
+        N, d = arr.shape
+        cov = np.eye(d)
+        x_etoile = arr[np.argmax(x.lpost)]
+        x_grad_etoile = x.shared["grad"][np.argmax(x.lpost)]
+        pi_x_etoile = max(x.lpost)
+        def compute_ESS(x, weights, alpha, cov):
+            arr = view_2d_array(x.theta)
+            x_etoile = arr[np.argmax(x.lpost)]
+            x_grad_etoile = x.shared["grad"][np.argmax(x.lpost)]
+            pi_x_etoile = max(x.lpost)
+            divisor_q = (2*np.pi)**(d/2)*alpha**(d/2)*np.sqrt(np.linalg.det(cov))
+            calc_accept_y = np.array([-(y - (x_etoile + alpha/2*x_grad_etoile))@np.linalg.inv(cov)@(y - (x_etoile - alpha/2*x_grad_etoile)).T for y in arr])
+            new_weights = weights/divisor_q*np.exp(-x.lpost + calc_accept_y/(2*alpha))
+            print("right use")
+            return np.sum(new_weights)**2/np.sum(new_weights**2)
+        def func(alpha, x, weights, cov, x_etoile, x_grad_etoile, pi_x_etoile, verbose = False):
+            arr = view_2d_array(x.theta)
+            if verbose:
+                print("alpha :", alpha)
+            if alpha >0:
+                
+                # calc_accept_y = np.array([-(y - (x_etoile + alpha/2*x_grad_etoile))@np.linalg.inv(cov)@(y - (x_etoile - alpha/2*x_grad_etoile)).T for y in arr])
+                #calc_accept_y = np.diag(((-x_etoile+x.theta-(alpha/2*cov@x_grad_etoile))@np.linalg.inv(cov))@(-x_etoile + x.theta -(alpha/2*cov@x_grad_etoile)).T)/(2*alpha)
+                #calc_accept_x_etoile = np.diag((x_etoile-x.theta -(alpha/2*x.shared['grad']@cov))@np.linalg.inv(cov)@(x_etoile - x.theta - (alpha/2*x.shared['grad']@cov)).T)/(2*alpha)
+                # calc_accept_x_etoile = np.array([-(-arr[i] + x_etoile - alpha/2*x.shared['grad'][i])@np.linalg.inv(cov)@(-arr[i] + x_etoile - alpha/2*x.shared['grad'][i]).T for i in range(len(arr))])
+                proba_q_y = -np.diag(((arr- x_etoile)/(4*alpha)-x_grad_etoile)@np.linalg.inv(cov)@((arr- x_etoile)/(4*alpha)-x_grad_etoile).T)
+                proba_q_x = -np.diag(((-arr + x_etoile)/(4*alpha)-x.shared['grad'])@np.linalg.inv(cov)@((-arr + x_etoile)/(4*alpha)-x.shared['grad']).T)
+        
+                d = arr.shape[1]
+                divisor_q = alpha**(d/2)
+                #print(np.exp(- x.lpost + np.minimum(x.lpost + (calc_accept_x_etoile- calc_accept_y)/(2*alpha) - pi_x_etoile, 0) + calc_accept_y/(2*alpha) + pi_x_etoile))
+                #sum_other = np.sum(weights/divisor_q*np.exp(calc_accept_y/(2*alpha) - x.lpost + pi_x_etoile))
+                #return np.sum(weights*np.exp(calc_accept_y/(2*alpha))*np.linalg.norm(arr - x_etoile)**2)
+                try:
+                    
+                    return np.sum(weights/divisor_q*np.exp(-x.lpost + np.minimum(x.lpost - pi_x_etoile +(proba_q_x - proba_q_y), 0) + proba_q_y + pi_x_etoile)*np.linalg.norm(arr - x_etoile, axis = 1)**2)
+                except:
+                    import pdb; pdb.set_trace()
+            else:
+                print("ALPHA négatif!!")
+                return 0
+        alphas = np.linspace(0.05,1,50)
+        tot = []
+        # for alpha in alphas:
+        #     print(alpha)
+        #     tot.append(func(alpha, x, W, cov, x_etoile, x_grad_etoile, pi_x_etoile))
+        #     #tot.append(compute_ESS(alpha = alpha, x = x, weights = W, cov = cov))
+        # plt.plot(alphas, tot)
+        # plt.show()
+        # import pdb; pdb.set_trace()
+        def func_final(alpha, x = x, weights = W, cov = cov, x_etoile = x_etoile, x_grad_etoile = x_grad_etoile, pi_x_etoile = pi_x_etoile):
+            return -func(alpha, x, weights, cov, x_etoile, x_grad_etoile, pi_x_etoile, False)
+            #return compute_ESS(alpha = alpha, x = x, weights = weights, cov = cov)
+        try:
+            optimal_alpha = optimize.minimize_scalar(func_final, bounds = (0.0, 1.), method = 'bounded', options = {'xatol' : 1e-2}).x
+            #optimal_alpha = optimize.newton(func, 0.2, args = (x, W, cov, post), maxiter = 300, tol = 0.1)
+        except:
+            print("Exception Raised")
+            optimal_alpha = 0.5
+        x.shared['chol_cov'] = np.eye(cov.shape[1])
+        print("optimal alpha",optimal_alpha)
+        #optimal_alpha = 0.16*50**(1/3)/arr.shape[1]**(1/3)
+        x.shared['eps'] = max(0,optimal_alpha)
+        
+class ArrayPCN(ArrayMCMC):
+    def proposal(self, x, xprop):
+        cov = x.shared['chol_cov']
+        eps = x.shared['eps']
+        arr = view_2d_array(x.theta)
+        arr_prop = view_2d_array(xprop.theta)   
+        add = eps*stats.norm.rvs(size=arr.shape)
+        arr_prop[:,:] = np.sqrt(1 - eps**2)*(arr - np.mean(arr)) + add + np.mean(arr)
+        return 0
+
+    def step(self,x, target = None):
+        xprop = x.__class__(theta=np.empty_like(x.theta))
+        delta_lp = self.proposal(x, xprop)
+        target(xprop)
+        lp_acc = xprop.lpost - x.lpost
+        pb_acc = np.exp(np.clip(lp_acc, None, 0.))
+        mean_acc = np.mean(pb_acc)
+        accept = (random.rand(x.N) < pb_acc)
+        x.copyto(xprop, where=accept)
+        # arr = view_2d_array(x.theta)
+        # plt.scatter(arr[:100,0], arr[:100,1], c = 'g')
+        # plt.show()
+        if np.isnan(mean_acc):
+            import pdb; pdb.set_trace()
+        return mean_acc
 
     def calibrate(self, W, x):
         arr = view_2d_array(x.theta)
         N, d = arr.shape
         m, cov = rs.wmean_and_cov(W, arr)
-        x.shared['chol_cov'] = np.linalg.inv(np.diag(np.diag(cov)))
-        # x.shared['eps'] = self.get_eps(x)
-        
+        cov = np.eye(cov.shape[0])  
+        scale = 0.5
+        try:
+            #x.shared['chol_cov'] = linalg.cholesky(cov, lower=True)
+            x.shared['chol_cov'] = np.eye(cov.shape[0])
+        except:
+            x.shared['chol_cov'] = np.eye(cov.shape[0])
+        x.shared['eps'] = scale
+    
+    def calibrate2(self, W,x):
+        arr = view_2d_array(x.theta)
+        N, d = arr.shape
+        m, cov = rs.wmean_and_cov(W, arr)
+        cov = np.eye(cov.shape[0])
+        argmaxi = np.argmax(x.lpost)
+        pi_x_etoile = x.lpost[argmaxi]
+        x_etoile = arr[np.argmax(x.lpost)]
+        sqrt_det = np.sqrt(np.linalg.det(cov))
+        x.shared['chol_cov'] = np.eye(cov.shape[0])
+        max_lp_y = np.diag(((arr - np.sqrt(1 - 0.05**2)*(x_etoile - np.mean(arr))) + np.mean(arr))@np.linalg.inv(0.05*cov)@(arr - np.sqrt(1 - 0.05**2)*(x_etoile - np.mean(arr)) + np.mean(arr)).T)
+
+        def func(eps, x, weights, cov, pi_x_etoile, sqrt_det, x_etoile, max_lp_y):
+            arr = view_2d_array(x.theta)
+            d = cov.shape[0]
+            divisor_q = eps**(d/2)*(2*np.pi)**(d/2)*sqrt_det
+            lp_acc_y = np.diag(((arr - np.sqrt(1 - eps**2)*(x_etoile - np.mean(arr)) + np.mean(arr)))@np.linalg.inv(eps*cov)@((arr - np.sqrt(1 - eps**2)*(x_etoile - np.mean(arr)) + np.mean(arr))).T)
+            # lp_acc_x = np.diag(((x_etoile - np.sqrt(1 - eps**2)*(arr - np.mean(arr)) + np.mean(arr)))@np.linalg.inv(eps*cov)@((x_etoile - np.sqrt(1 - eps**2)*(arr - np.mean(arr)) + np.mean(arr))).T)
+            # lp_acc_y = np.array([distributions.MvNormal(loc = np.sqrt(1- eps**2)*x_etoile, cov = eps*cov).logpdf(x = arr[i]) for i in range(len(arr))])
+            # lp_acc_x = np.array([distributions.MvNormal(loc = np.sqrt(1- eps**2)*arr[i], cov = eps*cov).logpdf(x = x_etoile) for i in range(len(arr))])
+            return np.sum(weights/divisor_q*np.exp(-x.lpost + pi_x_etoile + np.minimum(x.lpost - pi_x_etoile,0) - lp_acc_y)* np.linalg.norm(x_etoile - arr, axis = 1)**2)
+        alphas = np.linspace(0.05,1,50)
+        tot = []
+        # for alpha in alphas:
+        #     tot.append(func(alpha,x,W,cov, pi_x_etoile, sqrt_det, x_etoile, max_lp_y))
+        #     #tot.append(compute_ESS(alpha = alpha, x = x, weights = W, cov = cov))
+        # plt.plot(alphas, tot)
+        # plt.show()
+        def func_final(alpha, x = x, weights = W, cov = cov, pi_x_etoile = pi_x_etoile, sqrt_det = sqrt_det, x_etoile = x_etoile, max_lp_y = max_lp_y):
+            return -func(alpha, x, weights, cov, pi_x_etoile, sqrt_det, x_etoile, max_lp_y)
+        #try:
+        optimal_alpha = optimize.minimize_scalar(func_final, bounds = (0.05, 1.), method = 'bounded', options = {'xatol' : 1e-2}).x
+        # except:
+        #     print("Exception Raised")
+        #     optimal_alpha = 0.1
+        print("optimal alpha",optimal_alpha)
+        x.shared['eps'] = max(0,optimal_alpha)
+
 class ArrayMetropolis(ArrayMCMC):
     """Base class for Metropolis steps (whatever the proposal).
     """
@@ -626,13 +866,6 @@ class ArrayMetropolis(ArrayMCMC):
             import pdb; pdb.set_trace()
         return mean_acc
 
-# class ArrayAuxiliary(ArrayMCMC):
-#     """Kind of metropolis but using auxiliary variables."""
-#     def proposal(self, x, xprop):
-#         aux_var = x + stats.norm.rvs(size=arr.shape)
-#     def step(self, x, target = None):
-#         eps = 0.1
-
 class ArrayRandomWalk(ArrayMetropolis):
     """Gaussian random walk Metropolis.
     """
@@ -640,13 +873,126 @@ class ArrayRandomWalk(ArrayMetropolis):
         arr = view_2d_array(x.theta)
         N, d = arr.shape
         m, cov = rs.wmean_and_cov(W, arr)
+        cov = np.eye(cov.shape[0])  
         scale = 2.38 / np.sqrt(d)
-        x.shared['chol_cov'] = scale * linalg.cholesky(cov, lower=True)
+        try:
+            x.shared['chol_cov'] = scale * linalg.cholesky(cov, lower=True)
+        except:
+            x.shared['chol_cov'] = scale * np.eye(cov.shape[0])
 
+    def calibrate2(self, W, x):
+        arr = view_2d_array(x.theta)
+        N, d = arr.shape
+        m, cov = rs.wmean_and_cov(W, arr)
+        argmaxi = np.argmax(x.lpost)
+        pi_x_etoile = x.lpost[argmaxi]
+        x_etoile = arr[np.argmax(x.lpost)]
+        sqrt_det = np.sqrt(np.linalg.det(cov))
+        dans_exp = -np.diag((arr-x_etoile)@np.linalg.inv(cov)@(arr-x_etoile).T)
+        #dans_exp = np.array([-(y - x_etoile)@np.linalg.inv(cov)@(y-x_etoile).T for y in arr])
+        #arr = view_2d_array(x.theta)
+        alpha_opt = (2.38 / np.sqrt(d))**2
+        print(alpha_opt, "test")
+        def new_func(alpha, x, weights, cov, dans_exp, alpha_opt):
+            arr = view_2d_array(x.theta)
+            new_arr = arr + alpha_opt*stats.norm.rvs(size=arr.shape)
+            d = arr.shape[1]
+            dans_exp = -np.diag((new_arr - arr)@np.linalg.inv(cov)@(arr-x_etoile).T)
+            calc_exp = dans_exp/(2*alpha)
+            calc_exp_opt = dans_exp/(2*alpha_opt)
+            divisor_q_opt = alpha_opt**(d/2)
+            divisor_q = alpha**(d/2)
+            return np.sum(divisor_q/divisor_q_opt*np.exp(-calc_exp + calc_exp_opt))     
+        def compute_ESS_mean(alpha,x, weights, cov, pi_x_etoile, sqrt_det, dans_exp, x_etoile, verbose = False):
+            arr = view_2d_array(x.theta)
+            d = arr.shape[1]
+            calc_exp = dans_exp/(2*alpha)
+            divisor_q = alpha**(d/2)*(2*np.pi)**(d/2)*sqrt_det
+            new_weights = weights/divisor_q*np.exp(-x.lpost + calc_exp )
+            return x.N/(np.sum(new_weights)**2/np.sum(new_weights**2)) - 1
+        def compute_ESS(alpha,x, weights, cov, pi_x_etoile, sqrt_det, dans_exp, x_etoile, verbose = False):
+            arr = view_2d_array(x.theta)
+            d = arr.shape[1]
+            calc_exp = dans_exp/(2*alpha)
+            divisor_q = alpha**(d/2)*(2*np.pi)**(d/2)*sqrt_det
+            new_weights = weights/divisor_q*np.exp(-x.lpost + calc_exp )
+            return (np.sum(new_weights)**2/np.sum(new_weights**2))
+
+        def func(alpha, x, weights, cov, pi_x_etoile, sqrt_det, dans_exp, x_etoile, verbose = False):
+            arr = view_2d_array(x.theta)
+            if verbose:
+                print('alpha', alpha)
+            calc_exp = dans_exp/(2*alpha)
+            d = arr.shape[1]
+            divisor_q = alpha**(d/2)*(2*np.pi)**(d/2)*sqrt_det
+            #maxi = max(x.lpost)
+            #print((weights/post)/divisor_q*exp_q*np.minimum(post/pi_x_etoile, 1)*np.linalg.norm(arr - x_etoile, axis = 1)**2)
+            #sum_other = np.sum(weights/divisor_q*np.exp(calc_exp -x.lpost))
+            #print(np.sum((weights/post)/divisor_q/*exp_q*np.minimum(post/pi_x_etoile, 1)*np.linalg.norm(arr - x_etoile, axis = 1)**2))
+            # if alpha < 2:
+            #     print(weights/divisor_q*np.exp(calc_exp)/sum_other, alpha)
+            return np.sum(weights/divisor_q*np.exp( - x.lpost+ pi_x_etoile + np.minimum(x.lpost - pi_x_etoile,0) + calc_exp)* np.linalg.norm(x_etoile - arr, axis = 1)**2)
+            return np.sum((weights/post)*1/divisor_q*exp_q*np.minimum(post/pi_x_etoile, 1))/sum_other - 0.3
+        def func_final(alpha, x = x, weights = W, cov = cov, pi_x_etoile = pi_x_etoile, sqrt_det = sqrt_det, dans_exp = dans_exp, x_etoile = x_etoile):
+            return -new_func(alpha, x, weights, cov, pi_x_etoile, sqrt_det, dans_exp, x_etoile, False)
+
+        def new_func_final(alpha, x = x, weights = W, cov = cov, dans_exp = dans_exp, alpha_opt = alpha_opt):
+            return -new_func(alpha, x, weights, cov, dans_exp, alpha_opt)
+
+        # def f_final(alpha, x = x, weights = W, cov = cov, post = post):
+        #     return -f_compare(alpha, x, weights, cov, post, False)
+        optimal_alpha = optimize.minimize_scalar(new_func_final, bounds = (0.0, 3), method = 'bounded').x - 0.1
+        #print("somme:",optimize.minimize_scalar(f_final, bounds = (0.0, 5.), method = 'bounded').x)
+            #optimal_alpha = optimize.newton(f_prime, 0.3, args = (x, W, cov, post, True), maxiter = 300, tol = 0.05, fprime = f_second)
+        # except:
+        #     print("Exception Riased")
+        #     optimal_alpha = 2.38 / np.sqrt(d)
+        if optimal_alpha <= 0 or optimal_alpha > 10:
+            print("Wrong alpha: ", optimal_alpha)
+            optimal_alpha = (2.38 / np.sqrt(d))**2
+        
+        if True == True:
+            tot = []
+            diff = []
+            diff2diff = []
+            post = np.exp(x.lpost)
+            #pre_requis = calc_pre_requis(alpha,x,W, cov,post)
+            alphas = np.linspace(0.05,3, 100)
+            for alpha in alphas:
+                tot.append(new_func(alpha,x,W,cov, dans_exp, (2.38 / np.sqrt(d))**2))
+                #tot.append(new_func(alpha, x, W, cov, pi_x_etoile, sqrt_det, dans_exp, x_etoile, False))
+                # diff.append(compute_ESS_mean(alpha, x, W, cov, pi_x_etoile, sqrt_det, dans_exp, x_etoile, False))
+                # diff2diff.append(compute_ESS(alpha, x, W, cov, pi_x_etoile, sqrt_det, dans_exp, x_etoile, False))
+            names = ["func", "ESS"]
+            # plt.subplot(3, 1, 1)
+            # plt.plot(np.linspace(0.05,5,500), tot, color = 'black')
+            # plt.subplot(3, 1, 2)
+            # plt.plot(np.linspace(0.05, 5, 500), diff, color = 'red')
+            # plt.subplot(3,1,3)
+            # plt.plot(np.linspace(0.05,5,500), diff2diff, color = 'blue')
+            #plt.vlines([2.38/x.theta.shape[1]], ymax = 0.5, ymin = 0, color = 'r')
+            #plt.hlines(0, xmin = 0.05, xmax = 1, color = 'r')
+            plt.plot(alphas, tot, color = 'black')
+            plt.show()
+            # plt.plot(np.linspace(0.05, 5, 500), diff, color = 'red')
+            # plt.show()
+            last_list = 0
+            # for plot in os.listdir("/home/benj/Téléchargements/Stage CREST/plot/"):
+            #     if int(plot[:-4]) >last_list:
+            #         last_list = int(plot[:-4])
+            # last_list = str(last_list +1)
+            # plt.savefig("/home/benj/Téléchargements/Stage CREST/plot/" + last_list)
+        try:
+            x.shared['chol_cov'] = np.sqrt(optimal_alpha)*linalg.cholesky(cov, lower=True)
+        except:
+            print("exception in cholesky")
+            x.shared['chol_cov'] = np.sqrt(optimal_alpha)*np.eye(cov.shape[0])
+        print(optimal_alpha)
+        
     def proposal(self, x, xprop):
         L = x.shared['chol_cov']
         arr = view_2d_array(x.theta)
-        arr_prop = view_2d_array(xprop.theta)
+        arr_prop = view_2d_array(xprop.theta)   
         arr_prop[:, :] = (arr + stats.norm.rvs(size=arr.shape) @ L.T)
         return 0.
 
@@ -867,12 +1213,13 @@ class AdaptiveTempering(FKSMCsampler):
         else:
             delta = optimize.brentq(f, 1.e-12, 1. - epn)  # secant search
             # left endpoint is >0, since f(0.) = nan if any likelihood = -inf
+            if delta == 0. :
+                delta = 0.001
             new_epn = epn + delta
         x.shared['exponents'].append(new_epn)
         return self.logG_tempering(x, delta)
 
     def current_target(self, epn):
-
         def func(x):
             if self.model.autograd:
                 import jax
@@ -885,10 +1232,11 @@ class AdaptiveTempering(FKSMCsampler):
                 grad_and_val_fun = jax.vmap(jax.value_and_grad(tempered_potential, has_aux=True))
                 (x.lpost, (x.lprior, x.llik)), x.shared['grad'] = grad_and_val_fun(x.theta)
             else:
-                if hasattr(self.model, "gradlogpdf") and hasattr(self.model, "gradloglik"):
-                    x.shared['grad'] = self.model.gradlogpdf(x.theta) + epn*self.model.gradloglik(x.theta, self.model.data)
+                arr = view_2d_array(x.theta)
                 x.lprior = self.model.prior.logpdf(x.theta)
                 x.llik = self.model.loglik(x.theta)
+                if hasattr(self.model, "gradlogpdf") and hasattr(self.model, "gradloglik"):
+                    x.shared['grad'] = (1-epn)*self.model.gradlogpdf(arr) + epn*self.model.gradloglik(arr, self.model.data)
                 if epn > 0.:
                     x.lpost = x.lprior + epn * x.llik
                 else:  # avoid having 0 x Nan

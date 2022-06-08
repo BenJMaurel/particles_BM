@@ -350,6 +350,8 @@ def wmean_and_cov(W, x):
     """
     m = np.average(x, weights=W, axis=0)
     cov = np.cov(x.T, aweights=W, ddof=0)
+    if np.linalg.det(cov) == 0:
+        cov += np.eye(cov.shape[1])/1e-5
     return m, cov
 
 def wmean_and_var_str_array(W, x):

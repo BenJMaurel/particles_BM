@@ -774,7 +774,7 @@ class MvNormal(ProbDist):
         else:
             logdet = np.sum(np.log(self.scale), axis=-1)
         logdet += self.halflogdetcor
-        return - 0.5 * np.sum(z * z, axis=0) - logdet - self.dim * HALFLOG2PI
+        return - 0.5 * np.sum(z * z, axis=0) - logdet - self.dim * HALFLOG2PI   
 
     def rvs(self, size=None):
         if size is None:
